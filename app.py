@@ -838,6 +838,35 @@ def dart_rows_to_long(rows):
     return pd.DataFrame(out)
 
 
+# Only static, allowlisted diagnostics are shown to the user.
+# Never show upstream error text, complete URLs or exception objects: they may contain a secret key.
+_DART_STATUS_HINTS = {
+    "010": "등록되지 않은 인증키입니다. 새 키가 정확하게 등록됐는지 확인해 주세요.",
+    "011": "사용할 수 없는 인증키입니다. OpenDART 인증키 승인 상태를 확인해 주세요.",
+    "012": "API 요청 IP가 허용되지 않았습니다. OpenDART 인증키의 IP 제한 설정을 확인해 주세요.",
+    "013": "선택한 조건에 조회 가능한 자료가 없습니다. 사업연도와 보고서 종류를 확인해 주세요.",
+    "014": "OpenDART에 요청한 파일이 없습니다.",
+    "020": "OpenDART 요청 한도를 초과했습니다. 나중에 다시 시도해 주세요.",
+    "021": "조회 가능한 회사 수 제한을 초과했습니다.",
+    "100": "OpenDART 요청값이 올바르지 않습니다. 조회 조건을 확인해 주세요.",
+    "101": "OpenDART에서 허용되지 않은 접근으로 응답했습니다.",
+    "800": "OpenDART가 시스템 점검 중입니다. 나중에 다시 시도해 주세요.",
+    "900": "OpenDART에서 서버 오류가 발생했습니다. 나중에 다시 시도해 주세요.",
+    "901": "OpenDART 인증키를 사용할 수 없습니다. 발급 기관에 문의해 주세요.",
+}
+
+class OpenDartAPIError(Exception):
+    """Safe status-only error; never stores original request, key or response text."""
+    def __init__(self, code):
+        clean = str(code).strip()
+        self.code = clean if clean in _DART_STATUS_HINTS else "unknown"
+        if self.code == "unknown":
+            msg = "OpenDART에서 해석할 수 없는 응답을 받았습니다."
+        else:
+            msg = f"OpenDART 응답 코드 {self.code}: {_DART_STATUS_HINTS[self.code]}"
+        super().__init__(msg)
+
+
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def fetch_corp_codes(api_key):
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
@@ -848,10 +877,23 @@ def fetch_corp_codes(api_key):
         # requests 예외에는 crtfc_key가 담긴 전체 URL이 포함될 수 있습니다.
         raise ConnectionError("OpenDART 기업목록 통신 오류") from None
 
-    zf = zipfile.ZipFile(io.BytesIO(res.content))
-    xml_name = zf.namelist()[0]
-    xml_bytes = zf.read(xml_name)
-    root = ET.fromstring(xml_bytes)
+    # corpCode.xml normally returns a ZIP. Invalid keys / IP restrictions may
+    # instead return an XML <result> with HTTP 200, not a ZIP.
+    if not zipfile.is_zipfile(io.BytesIO(res.content)):
+        try:
+            error_root = ET.fromstring(res.content)
+            status = error_root.findtext("status", default="").strip()
+        except (ET.ParseError, ValueError):
+            status = ""
+        raise OpenDartAPIError(status) from None
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            xml_name = zf.namelist()[0]
+            xml_bytes = zf.read(xml_name)
+        root = ET.fromstring(xml_bytes)
+    except (zipfile.BadZipFile, IndexError, ET.ParseError):
+        raise OpenDartAPIError("unknown") from None
 
     rows = []
     for item in root.findall("list"):
@@ -937,9 +979,11 @@ def fetch_dart_financials(api_key, corp_code, year, report_code, fs_div):
     except (requests.RequestException, ValueError):
         # 원본 예외의 URL과 쿼리스트링은 인증키를 포함할 수 있어 폐기합니다.
         raise ConnectionError("OpenDART 재무제표 통신 오류") from None
+    if not isinstance(data, dict):
+        raise OpenDartAPIError("unknown")
     if data.get("status") != "000":
-        # 원문 오류 메시지에 요청 정보가 포함되더라도 화면에 전달하지 않습니다.
-        raise LookupError("OpenDART 재무제표 조회 결과가 없습니다.")
+        # Display only the documented status code and a fixed explanation.
+        raise OpenDartAPIError(data.get("status", "unknown"))
     return data.get("list", [])
 
 
@@ -1551,9 +1595,12 @@ elif input_mode == "OpenDART 자동 조회":
                                     rcp_no = str(long_df["rcept_no"].dropna().iloc[0])
                                     if re.fullmatch(r"\d{14}", rcp_no):
                                         st.markdown(f"[DART 원문 공시 열기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no})")
+            except OpenDartAPIError as e:
+                # OpenDartAPIError contains only an allowlisted numeric code and
+                # a fixed Korean explanation, never a URL or an API key.
+                st.error(str(e))
             except (requests.RequestException, ConnectionError, ValueError, LookupError):
-                # 요청 URL에 인증키가 포함될 수 있으므로 원본 예외 메시지는 보여주지 않습니다.
-                st.error("OpenDART 조회에 실패했습니다. 통신 상태·사업연도·보고서 종류를 확인해 주세요.")
+                st.error("OpenDART 서버 연결에 실패했습니다. 네트워크 또는 OpenDART 서비스 상태를 확인해 주세요.")
             except Exception:
                 st.error("OpenDART 조회에 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.")
     elif saved_dart is not None:
