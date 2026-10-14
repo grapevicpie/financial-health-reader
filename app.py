@@ -1,6 +1,13 @@
 
 import io
 import re
+from html import escape
+from quality_checks import (
+    dart_request_signature,
+    matching_saved_analysis,
+    missing_score_fields,
+    verify_dart_rows,
+)
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -784,8 +791,9 @@ def read_uploaded_file(uploaded_file, multiplier=1):
             df = pd.read_csv(uploaded_file, sep=None, engine="python")
             tables[uploaded_file.name] = df
             long_parts.append(wide_to_long(df, statement_name="업로드 재무표", multiplier=multiplier, source="업로드"))
-    except Exception as e:
-        st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+    except Exception:
+        # 사용자 파일명이나 내부 예외 등 민감한 정보는 화면에 그대로 출력하지 않습니다.
+        st.error("파일을 읽지 못했습니다. 형식과 인코딩을 확인해 주세요.")
         return pd.DataFrame(columns=["statement", "account", "period", "amount", "raw_value", "source", "period_sort"]), {}
 
     if long_parts:
@@ -833,8 +841,12 @@ def dart_rows_to_long(rows):
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def fetch_corp_codes(api_key):
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    res = requests.get(url, params={"crtfc_key": api_key}, timeout=20)
-    res.raise_for_status()
+    try:
+        res = requests.get(url, params={"crtfc_key": api_key}, timeout=20)
+        res.raise_for_status()
+    except requests.RequestException:
+        # requests 예외에는 crtfc_key가 담긴 전체 URL이 포함될 수 있습니다.
+        raise ConnectionError("OpenDART 기업목록 통신 오류") from None
 
     zf = zipfile.ZipFile(io.BytesIO(res.content))
     xml_name = zf.namelist()[0]
@@ -918,11 +930,16 @@ def fetch_dart_financials(api_key, corp_code, year, report_code, fs_div):
         "reprt_code": report_code,
         "fs_div": fs_div,
     }
-    res = requests.get(url, params=params, timeout=25)
-    res.raise_for_status()
-    data = res.json()
+    try:
+        res = requests.get(url, params=params, timeout=25)
+        res.raise_for_status()
+        data = res.json()
+    except (requests.RequestException, ValueError):
+        # 원본 예외의 URL과 쿼리스트링은 인증키를 포함할 수 있어 폐기합니다.
+        raise ConnectionError("OpenDART 재무제표 통신 오류") from None
     if data.get("status") != "000":
-        raise RuntimeError(f"{data.get('message', '조회 실패')} (status: {data.get('status')})")
+        # 원문 오류 메시지에 요청 정보가 포함되더라도 화면에 전달하지 않습니다.
+        raise LookupError("OpenDART 재무제표 조회 결과가 없습니다.")
     return data.get("list", [])
 
 
@@ -1185,7 +1202,9 @@ def make_plain_summary(m, strengths, warnings, footnote_findings, grade):
     if not lines:
         lines.append("입력된 표에서 핵심 계정이 충분히 인식되지 않았습니다. 항목명을 매출액, 영업이익, 자산총계처럼 표준적으로 입력하면 분석 정확도가 올라갑니다.")
 
-    if grade in ["매우 양호", "양호"]:
+    if grade == "자료 부족":
+        conclusion = "필수 재무자료가 부족해 종합적인 재무 상태를 평가할 수 없습니다."
+    elif grade in ["매우 양호", "양호"]:
         conclusion = "전반적으로 재무 상태는 비교적 안정적으로 보입니다."
     elif grade == "보통 / 추가 확인":
         conclusion = "일부 지표는 긍정적이지만, 숫자만으로 단정하기보다 원문과 주석 확인이 필요합니다."
@@ -1370,15 +1389,32 @@ elif input_mode == "표 붙여넣기":
     with tabs[4]:
         footnote_text = st.text_area("주석, 감사의견, 특이사항 텍스트", height=260, placeholder=SAMPLE_TABLES["주석"])
 
+    # 입력값이 달라지면 이전에 분석한 표를 새 표의 결과로 보여주지 않습니다.
+    paste_signature = (
+        tuple((statement, pasted[statement]) for statement in pasted),
+        multiplier,
+    )
     if st.button("🔍 재무제표 분석 실행", type="primary"):
+        st.session_state.pop("pasted_analysis", None)
         parts = []
         for stmt, text in pasted.items():
             if text.strip():
                 parts.append(parse_pasted_table(text, stmt, multiplier=multiplier))
+        parts = [part for part in parts if not part.empty]
         if parts:
             long_df = pd.concat(parts, ignore_index=True)
+            st.session_state["pasted_analysis"] = {
+                "signature": paste_signature,
+                "data": long_df.copy(),
+            }
         else:
-            st.warning("분석할 표를 하나 이상 붙여넣어 주세요.")
+            st.warning("인식할 수 있는 표가 없습니다. 계정명과 숫자 열을 확인해 주세요.")
+    else:
+        saved_paste = st.session_state.get("pasted_analysis")
+        if saved_paste and saved_paste.get("signature") == paste_signature:
+            long_df = saved_paste["data"].copy()
+        elif saved_paste:
+            st.session_state.pop("pasted_analysis", None)
 
 elif input_mode == "엑셀/CSV 업로드":
     st.markdown('<div class="section-title">📁 엑셀/CSV 업로드</div>', unsafe_allow_html=True)
@@ -1414,14 +1450,21 @@ elif input_mode == "OpenDART 자동 조회":
     except Exception:
         default_key = ""
 
-    with st.expander("🔐 OpenDART API 키 상태", expanded=not bool(default_key)):
-        if default_key:
-            st.success("Streamlit Secrets에 OPENDART_API_KEY가 연결되어 있습니다.")
+    # 키가 노출되었던 서비스의 안전한 기본값: 관리자가 명시적으로 재개할 때만 API를 호출합니다.
+    try:
+        opendart_enabled = st.secrets.get("OPENDART_ENABLED", False) is True
+    except Exception:
+        opendart_enabled = False
+    with st.expander("🔐 OpenDART 조회 상태", expanded=not opendart_enabled):
+        if not opendart_enabled:
+            st.warning("현재 자동 조회는 보안점검을 위해 일시 중지했습니다. 샘플·붙여넣기·CSV 분석은 정상 이용할 수 있습니다.")
+        elif default_key:
+            st.success("OpenDART 자동 조회가 설정되어 있습니다.")
         else:
-            st.info("OPENDART_API_KEY가 아직 연결되지 않았습니다. 자동 조회만 제한되며, 샘플·붙여넣기·업로드 분석은 바로 사용할 수 있습니다.")
-        temp_key = st.text_input("임시 OpenDART API 키 입력(선택)", type="password", value="")
+            st.info("OpenDART 인증키가 등록되지 않았습니다.")
+        st.caption("인증키는 입력창이나 오류 메시지에 표시하지 않고 Streamlit Secrets에서만 관리합니다.")
 
-    api_key = default_key or temp_key
+    api_key = default_key if opendart_enabled else ""
 
     col1, col2 = st.columns([1.25, 1])
     with col1:
@@ -1442,9 +1485,23 @@ elif input_mode == "OpenDART 자동 조회":
 
     footnote_text = st.text_area("주석/감사의견 텍스트 붙여넣기(선택)", height=170, placeholder="OpenDART 주석 자동 조회는 추후 확장 영역입니다. 지금은 중요한 주석 문구를 붙여넣으면 특이사항을 탐지합니다.")
 
-    if st.button("🏛️ OpenDART에서 조회하고 분석", type="primary"):
+    # 자동 조회 중지 시 이전에 조회한 결과도 화면에서 제거합니다.
+    if not opendart_enabled:
+        st.session_state.pop("dart_analysis", None)
+    # 성공했던 검색과 현재 검색 조건이 정확히 같을 때만 결과를 복원합니다.
+    # 이전 기업·이전 사업연도 결과가 새 조회에 섞이는 문제를 예방합니다.
+    request_signature = dart_request_signature(corp_query, year, report_name, fs_div_label)
+    saved_dart = matching_saved_analysis(st.session_state.get("dart_analysis"), request_signature)
+    if saved_dart is None:
+        st.session_state.pop("dart_analysis", None)
+
+    if st.button("🏛️ OpenDART에서 조회하고 분석", type="primary", disabled=not opendart_enabled):
+        # 새 조회가 시작되는 순간 과거 검색 결과를 삭제합니다.
+        st.session_state.pop("dart_analysis", None)
         if not api_key:
-            st.warning("OpenDART 자동 조회에는 API 키가 필요합니다. 표 붙여넣기/업로드 분석은 키 없이도 사용할 수 있습니다. 배포 후에는 Streamlit Secrets에 OPENDART_API_KEY를 넣어 주세요.")
+            st.warning("OpenDART 자동 조회에는 API 키가 필요합니다. 표 붙여넣기/업로드 분석은 키 없이 사용할 수 있습니다.")
+        elif not corp_query.strip():
+            st.warning("조회할 기업명이나 종목코드를 입력해 주세요.")
         else:
             try:
                 with st.spinner("기업 고유번호를 찾는 중입니다..."):
@@ -1454,17 +1511,6 @@ elif input_mode == "OpenDART 자동 조회":
                     st.error("기업을 찾지 못했습니다. 회사명 또는 종목코드를 다시 입력해 주세요.")
                 else:
                     selected = matches.iloc[0]
-                    current_company_info = {
-                        "query": corp_query,
-                        "corp_name": selected["corp_name"],
-                        "canonical_name": selected["corp_name"],
-                        "stock_code": selected["stock_code"] or "",
-                        "year": int(year),
-                        "report": report_name,
-                        "fs_div": fs_div_label,
-                    }
-                    st.session_state["current_company_info"] = current_company_info
-                    st.success(f"조회 기업: {selected['corp_name']} / 종목코드: {selected['stock_code'] or '비상장'}")
                     with st.spinner("OpenDART 재무제표를 불러오는 중입니다..."):
                         rows = fetch_dart_financials(
                             api_key=api_key,
@@ -1473,32 +1519,50 @@ elif input_mode == "OpenDART 자동 조회":
                             report_code=REPORT_CODES[report_name],
                             fs_div="CFS" if fs_div_label.startswith("연결") else "OFS",
                         )
-                        long_df = dart_rows_to_long(rows)
-                    if "rcept_no" in long_df.columns and long_df["rcept_no"].notna().any():
-                        rcp_no = long_df["rcept_no"].dropna().astype(str).iloc[0]
-                        st.markdown(f"[DART 원문 공시 열기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no})")
-            except Exception as e:
-                st.error(f"OpenDART 조회 중 오류가 발생했습니다: {e}")
+                        verified, reason = verify_dart_rows(rows, year)
+                        if not verified:
+                            if reason == "year_mismatch":
+                                st.warning(f"{year}년과 다른 사업연도의 자료가 반환되어 분석을 중단했습니다.")
+                            else:
+                                st.warning(f"{year}년 {report_name}에 해당하는 재무자료가 없습니다.")
+                        else:
+                            candidate_df = dart_rows_to_long(rows)
+                            if candidate_df.empty:
+                                st.warning(f"{year}년 재무자료를 해석할 수 없습니다. 다른 보고서나 사업연도를 선택해 주세요.")
+                            else:
+                                company_info = {
+                                    "query": corp_query,
+                                    "corp_name": selected["corp_name"],
+                                    "canonical_name": selected["corp_name"],
+                                    "stock_code": selected["stock_code"] or "",
+                                    "year": int(year),  # 성공한 요청의 사업연도만 결과에 표시
+                                    "report": report_name,
+                                    "fs_div": fs_div_label,
+                                }
+                                st.session_state["dart_analysis"] = {
+                                    "signature": request_signature,
+                                    "data": candidate_df.copy(),
+                                    "company_info": company_info,
+                                }
+                                long_df = candidate_df
+                                current_company_info = company_info
+                                st.success(f"조회 기업: {selected['corp_name']} / 종목코드: {selected['stock_code'] or '비상장'}")
+                                if "rcept_no" in long_df.columns and long_df["rcept_no"].notna().any():
+                                    rcp_no = str(long_df["rcept_no"].dropna().iloc[0])
+                                    if re.fullmatch(r"\d{14}", rcp_no):
+                                        st.markdown(f"[DART 원문 공시 열기](https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcp_no})")
+            except (requests.RequestException, ConnectionError, ValueError, LookupError):
+                # 요청 URL에 인증키가 포함될 수 있으므로 원본 예외 메시지는 보여주지 않습니다.
+                st.error("OpenDART 조회에 실패했습니다. 통신 상태·사업연도·보고서 종류를 확인해 주세요.")
+            except Exception:
+                st.error("OpenDART 조회에 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.")
+    elif saved_dart is not None:
+        long_df = saved_dart["data"].copy()
+        current_company_info = saved_dart["company_info"]
 
-
-if manual_company_name.strip():
-    current_company_info = {
-        "query": manual_company_name.strip(),
-        "canonical_name": manual_company_name.strip(),
-    }
-
-if not long_df.empty:
-    st.session_state["last_long_df"] = long_df
-    st.session_state["last_footnote_text"] = footnote_text
-    st.session_state["last_company_info"] = current_company_info
-
-if "last_long_df" in st.session_state and input_mode in ["표 붙여넣기", "OpenDART 자동 조회"] and long_df.empty:
-    long_df = st.session_state["last_long_df"]
-    footnote_text = st.session_state.get("last_footnote_text", footnote_text)
-    current_company_info = st.session_state.get("last_company_info", current_company_info)
-
-if "current_company_info" in st.session_state and input_mode == "OpenDART 자동 조회":
-    current_company_info = st.session_state.get("current_company_info", current_company_info)
+# 다른 입력 방식이나 과거 버전의 캐시를 현재 조회 결과로 복원하지 않습니다.
+for legacy_key in ("last_long_df", "last_footnote_text", "last_company_info", "current_company_info"):
+    st.session_state.pop(legacy_key, None)
 
 
 # ============================================================
@@ -1527,15 +1591,29 @@ metrics, strengths, warnings, metric_table = build_metrics(
     shares=shares if shares > 0 else None,
 )
 footnote_findings = analyze_footnotes(footnote_text)
-score, grade, grade_desc, badge_class = calculate_health_score(metrics, warnings, footnote_findings)
+missing_fields = missing_score_fields(metrics)
+if missing_fields:
+    score = None
+    grade = "자료 부족"
+    grade_desc = "손익·재무상태·현금흐름의 필수 항목이 갖춰져야 종합점수를 계산할 수 있습니다."
+    badge_class = "badge-warn"
+else:
+    score, grade, grade_desc, badge_class = calculate_health_score(metrics, warnings, footnote_findings)
 summary = make_plain_summary(metrics, strengths, warnings, footnote_findings, grade)
 questions = make_questions(metrics, warnings, footnote_findings)
 
 st.markdown('<div class="section-title">📌 분석 결과</div>', unsafe_allow_html=True)
+if missing_fields:
+    st.warning("종합 평가 보류: " + ", ".join(missing_fields) + " 자료가 부족합니다. 확인 가능한 지표만 아래에 표시합니다.")
+else:
+    st.caption("재무 건강점수는 자체 규칙에 따른 참고용 지표이며, 투자판단·신용등급·회계감사 결과를 의미하지 않습니다.")
+if not footnote_findings.empty and (footnote_findings["중요도"] == "높음").any():
+    st.warning("입력된 주석·감사의견에서 확인이 필요한 표현이 감지되었습니다. 건강점수가 높더라도 원문 문맥을 반드시 확인해 주세요.")
+st.caption("주석·감사의견의 키워드 탐지는 사용자가 입력한 텍스트에만 적용되며, 공시 주석을 자동 수집하거나 감사의견을 판정하지 않습니다.")
 st.markdown(
     f"""
     <div class="soft-card" style="margin-bottom:0.7rem;">
-        <span class="badge badge-info">🏢 {make_company_badge(current_company_info)}</span>
+        <span class="badge badge-info">🏢 {escape(make_company_badge(current_company_info))}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1545,7 +1623,7 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("종합 등급", grade)
 with c2:
-    st.metric("재무 건강 점수", f"{score}/100")
+    st.metric("참고용 재무 건강점수", f"{score}/100" if score is not None else "평가 보류")
 with c3:
     st.metric("좋은 신호", f"{len(strengths)}개")
 with c4:
@@ -1555,12 +1633,12 @@ st.markdown(
     f"""
     <div class="result-card">
         <span class="badge {badge_class}">🩺 {grade}</span>
-        <span class="badge badge-info">🏢 {make_company_badge(current_company_info)}</span>
-        <span class="badge badge-info">📄 재무제표 자동 해석</span>
-        <div class="gauge-wrap"><div class="gauge-fill" style="width:{score}%;"></div></div>
+        <span class="badge badge-info">🏢 {escape(make_company_badge(current_company_info))}</span>
+        <span class="badge badge-info">📄 재무제표 규칙 기반 해석</span>
+        {f'<div class="gauge-wrap"><div class="gauge-fill" style="width:{score}%;"></div></div>' if score is not None else '<div class="small-caption">종합점수는 필수 재무자료 확보 후 표시합니다.</div>'}
         <div style="height:0.82rem;"></div>
         <div class="summary-title">한 줄 결론</div>
-        <div class="summary-text">{summary}</div>
+        <div class="summary-text">{escape(summary)}</div>
         <div class="small-caption" style="margin-top:0.66rem;">{grade_desc}</div>
     </div>
     """,
@@ -1571,7 +1649,7 @@ tabs = st.tabs(["🏠 쉬운 요약", "📊 핵심 지표", "📋 재무표 보�
 
 with tabs[0]:
     st.markdown('<div class="section-title">일반인용 쉬운 해석</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="soft-card">{summary}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="soft-card">{escape(summary)}</div>', unsafe_allow_html=True)
 
     col_a, col_b = st.columns(2)
     with col_a:
