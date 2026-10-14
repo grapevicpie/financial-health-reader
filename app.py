@@ -1,6 +1,7 @@
 
 import io
 import re
+import time
 from html import escape
 from quality_checks import (
     dart_request_signature,
@@ -867,15 +868,105 @@ class OpenDartAPIError(Exception):
         super().__init__(msg)
 
 
+class OpenDartTransportError(Exception):
+    """Safe connection failure without request URLs, parameters or credential text."""
+    def __init__(self, stage, category, http_status=None):
+        safe_stage = stage if stage in ("기업목록", "재무제표") else "API"
+        safe_category = category if category in (
+            "SSL 인증서 검증 오류", "연결 시간 초과", "응답 대기 시간 초과",
+            "프록시 연결 실패", "서버 접속 실패", "HTTP 오류", "JSON 응답 해석 실패",
+        ) else "통신 오류"
+        if safe_category == "HTTP 오류" and type(http_status) is int and 100 <= http_status <= 599:
+            explanation = f"HTTP {http_status}"
+        else:
+            explanation = safe_category
+        self.stage = safe_stage
+        self.category = safe_category
+        self.http_status = http_status if type(http_status) is int else None
+        super().__init__(
+            f"OpenDART {safe_stage} 요청 실패: {explanation}. "
+            "이 메시지에는 인증키나 요청 URL이 포함되지 않습니다."
+        )
+
+
+def safe_dart_transport_error(stage, err):
+    # Avoid str(err): requests error strings often contain a URL containing crtfc_key.
+    if isinstance(err, requests.exceptions.SSLError):
+        return OpenDartTransportError(stage, "SSL 인증서 검증 오류")
+    if isinstance(err, requests.exceptions.ConnectTimeout):
+        return OpenDartTransportError(stage, "연결 시간 초과")
+    if isinstance(err, requests.exceptions.ReadTimeout):
+        return OpenDartTransportError(stage, "응답 대기 시간 초과")
+    if isinstance(err, requests.exceptions.ProxyError):
+        return OpenDartTransportError(stage, "프록시 연결 실패")
+    if isinstance(err, requests.exceptions.HTTPError):
+        code = getattr(getattr(err, "response", None), "status_code", None)
+        return OpenDartTransportError(stage, "HTTP 오류", code)
+    return OpenDartTransportError(stage, "서버 접속 실패")
+
+
+# 일부 기업은 공시 고유번호가 공식 자료에서 확인되어 있어
+# 매번 전체 기업 목록 ZIP을 내려받지 않고 바로 재무제표를 조회합니다.
+# 추가할 때에는 공시 고유번호(8자리)를 검증한 후 등록해야 합니다.
+KNOWN_DART_CORP_CODES = {
+    "005930": "00126380",  # 삼성전자 (OpenDART corp_code)
+}
+
+
+def resolve_direct_corp(query):
+    """고유번호 입력 또는 검증된 기업 별칭이면 목록 다운로드를 생략합니다."""
+    original = str(query).strip()
+    if re.fullmatch(r"[0-9]{8}", original):
+        return {
+            "corp_code": original,
+            "corp_name": f"공시 고유번호 {original}",
+            "stock_code": "",
+        }
+    company = resolve_company_alias(original)
+    if company:
+        stock = str(company.get("stock_code", "")).strip()
+        code = KNOWN_DART_CORP_CODES.get(stock)
+        if code:
+            return {
+                "corp_code": code,
+                "corp_name": company["canonical_name"],
+                "stock_code": stock,
+            }
+    return None
+
+
+def dart_get(stage, url, params, timeout=(10, 35)):
+    """일시적인 연결 오류만 재시도하며 요청 URL/인증키는 노출하지 않습니다."""
+    retryable_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=timeout,
+                headers={"Accept": "application/json, application/zip, application/xml;q=0.9"},
+            )
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            transient = (
+                isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout))
+                or (isinstance(exc, requests.exceptions.HTTPError) and status in retryable_statuses)
+                or (isinstance(exc, requests.exceptions.ConnectionError)
+                    and not isinstance(exc, (requests.exceptions.SSLError, requests.exceptions.ProxyError)))
+            )
+            if transient and attempt < 2:
+                time.sleep(0.5 * (2 ** attempt))
+                continue
+            raise safe_dart_transport_error(stage, exc) from None
+    raise OpenDartTransportError(stage, "서버 접속 실패")
+
+
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def fetch_corp_codes(api_key):
     url = "https://opendart.fss.or.kr/api/corpCode.xml"
-    try:
-        res = requests.get(url, params={"crtfc_key": api_key}, timeout=20)
-        res.raise_for_status()
-    except requests.RequestException:
-        # requests 예외에는 crtfc_key가 담긴 전체 URL이 포함될 수 있습니다.
-        raise ConnectionError("OpenDART 기업목록 통신 오류") from None
+    res = dart_get("기업목록", url, {"crtfc_key": api_key}, timeout=(10, 50))
 
     # corpCode.xml normally returns a ZIP. Invalid keys / IP restrictions may
     # instead return an XML <result> with HTTP 200, not a ZIP.
@@ -972,13 +1063,11 @@ def fetch_dart_financials(api_key, corp_code, year, report_code, fs_div):
         "reprt_code": report_code,
         "fs_div": fs_div,
     }
+    res = dart_get("재무제표", url, params, timeout=(10, 35))
     try:
-        res = requests.get(url, params=params, timeout=25)
-        res.raise_for_status()
         data = res.json()
-    except (requests.RequestException, ValueError):
-        # 원본 예외의 URL과 쿼리스트링은 인증키를 포함할 수 있어 폐기합니다.
-        raise ConnectionError("OpenDART 재무제표 통신 오류") from None
+    except ValueError:
+        raise OpenDartTransportError("재무제표", "JSON 응답 해석 실패") from None
     if not isinstance(data, dict):
         raise OpenDartAPIError("unknown")
     if data.get("status") != "000":
@@ -1512,12 +1601,12 @@ elif input_mode == "OpenDART 자동 조회":
 
     col1, col2 = st.columns([1.25, 1])
     with col1:
-        corp_query = st.text_input("기업명 또는 종목코드", value="삼성전자", placeholder="예: SK하이닉스, sk hynix, 에스케이하이닉스, 000660")
+        corp_query = st.text_input("기업명 · 종목코드 · 공시 고유번호", value="삼성전자", placeholder="예: 삼성전자, 005930, 00126380")
         resolved_alias = resolve_company_alias(corp_query)
         if resolved_alias:
             st.caption(f"인식된 기업: {resolved_alias['canonical_name']} · 종목코드 {resolved_alias['stock_code']}")
         else:
-            st.caption("회사명, 영문명, 종목코드로 검색할 수 있습니다.")
+            st.caption("회사명·종목코드·공시 고유번호(8자리)로 검색할 수 있습니다.")
     with col2:
         year = st.number_input("사업연도", min_value=2015, max_value=datetime.now().year, value=max(2015, datetime.now().year - 1), step=1)
 
@@ -1548,13 +1637,19 @@ elif input_mode == "OpenDART 자동 조회":
             st.warning("조회할 기업명이나 종목코드를 입력해 주세요.")
         else:
             try:
-                with st.spinner("기업 고유번호를 찾는 중입니다..."):
-                    corp_df = fetch_corp_codes(api_key)
-                    matches = search_corp(corp_df, corp_query)
-                if matches.empty:
-                    st.error("기업을 찾지 못했습니다. 회사명 또는 종목코드를 다시 입력해 주세요.")
+                selected = resolve_direct_corp(corp_query)
+                if selected is None:
+                    # 기업명이든 종목코드든 목록 조회는 검증된 직접 매핑이 없을 때만 수행합니다.
+                    with st.spinner("기업 고유번호를 찾는 중입니다..."):
+                        corp_df = fetch_corp_codes(api_key)
+                        matches = search_corp(corp_df, corp_query)
+                    if matches.empty:
+                        st.error("기업을 찾지 못했습니다. 회사명 또는 종목코드를 다시 입력해 주세요.")
+                    else:
+                        selected = matches.iloc[0].to_dict()
                 else:
-                    selected = matches.iloc[0]
+                    st.caption("확인된 공시 고유번호로 재무제표를 직접 조회합니다. 기업목록 다운로드를 생략했습니다.")
+                if selected is not None:
                     with st.spinner("OpenDART 재무제표를 불러오는 중입니다..."):
                         rows = fetch_dart_financials(
                             api_key=api_key,
@@ -1599,8 +1694,19 @@ elif input_mode == "OpenDART 자동 조회":
                 # OpenDartAPIError contains only an allowlisted numeric code and
                 # a fixed Korean explanation, never a URL or an API key.
                 st.error(str(e))
-            except (requests.RequestException, ConnectionError, ValueError, LookupError):
-                st.error("OpenDART 서버 연결에 실패했습니다. 네트워크 또는 OpenDART 서비스 상태를 확인해 주세요.")
+            except OpenDartTransportError as e:
+                # Stage and transport class only; never render raw exceptions.
+                st.error(str(e))
+                if e.category == "SSL 인증서 검증 오류":
+                    st.info("Streamlit Cloud 서버의 인증서 검증 문제일 수 있습니다. SSL 검증을 끄지 말고 서버 환경을 점검해 주세요.")
+                elif e.category in ("연결 시간 초과", "응답 대기 시간 초과"):
+                    st.info("서버 응답이 지연됐습니다. 잠시 후 재조회하거나 서비스 상태를 확인해 주세요.")
+                elif e.http_status == 403:
+                    st.info("서버가 요청을 거부했습니다. OpenDART 인증키의 접근 IP 제한이나 서버 접근 정책을 확인해 주세요.")
+            except (requests.RequestException, ConnectionError):
+                st.error("OpenDART 연결이 완료되지 않았습니다. Streamlit Cloud의 외부 통신 상태를 확인해 주세요.")
+            except (ValueError, LookupError):
+                st.error("조회 응답을 처리하는 과정에서 문제가 발생했습니다. 코드 또는 데이터 형식을 확인해 주세요.")
             except Exception:
                 st.error("OpenDART 조회에 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.")
     elif saved_dart is not None:
