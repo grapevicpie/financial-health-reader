@@ -12,7 +12,13 @@ from typing import Callable
 import pandas as pd
 import requests
 
-BASE_URL = "https://opendart.fss.or.kr"
+# 금융감독원이 공식 문서에 기재한 두 API 주소입니다.
+# 한국어 API가 연결 시간 초과일 때 영어 API 호스트로 한 번 자동 전환합니다.
+API_ENDPOINTS = (
+    ("https://opendart.fss.or.kr", "/api"),
+    ("https://engopendart.fss.or.kr", "/engapi"),
+)
+BASE_URL = API_ENDPOINTS[0][0]
 REPORT_CODES = {
     "사업보고서": "11011",
     "반기보고서": "11012",
@@ -76,7 +82,12 @@ class DartClient:
         self.sleeper = sleeper
 
     def request(self, path: str, stage: str, params: dict | None = None,
-                timeout=(8, 25), attempts=2):
+                timeout=(5, 20), attempts=2):
+        """동일 기관이 공개한 대체 호스트로 자동 전환합니다.
+
+        인증/쿼터/입력값 오류 등 API가 *정상 응답*을 돌려준 경우에는
+        우회하지 않습니다. IP 정책을 회피하는 용도가 아닙니다.
+        """
         allowed = {
             "/api/corpCode.xml",
             "/api/company.json",
@@ -85,37 +96,43 @@ class DartClient:
         if path not in allowed:
             raise DartError(stage, "invalid")
         args = {"crtfc_key": self.api_key, **(params or {})}
-        for attempt in range(attempts):
+        # 연결이 안 되는 호스트에 같은 요청을 세 번씩 반복하지 않고
+        # 공식 대체 호스트를 바로 시도합니다.
+        last_error = None
+        for base, api_prefix in API_ENDPOINTS:
+            url = base + api_prefix + path[len("/api"):]
             try:
                 resp = self.getter(
-                    BASE_URL + path,
+                    url,
                     params=args,
                     timeout=timeout,
-                    headers={"User-Agent": "FinancialHealthReader/2.0", "Accept": "application/json, application/xml, application/zip"},
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; FinancialHealthReader/3.1)",
+                        "Accept": "application/json, application/xml, application/zip",
+                    },
                 )
-                if resp.status_code >= 400:
-                    if resp.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
-                        self.sleeper(0.6 * (attempt + 1))
-                        continue
+                # 사용제한·인증·입력 오류: 다른 호스트로 재시도하면 안 됩니다.
+                if resp.status_code in (400, 401, 403, 404, 429):
+                    raise DartError(stage, "http", str(resp.status_code))
+                if resp.status_code >= 500:
+                    last_error = DartError(stage, "http", str(resp.status_code))
+                    continue
+                if resp.status_code >= 300:
                     raise DartError(stage, "http", str(resp.status_code))
                 return resp
             except DartError:
                 raise
             except requests.exceptions.SSLError:
-                raise DartError(stage, "ssl") from None
+                last_error = DartError(stage, "ssl")
             except requests.exceptions.ProxyError:
-                raise DartError(stage, "proxy") from None
+                last_error = DartError(stage, "proxy")
             except requests.exceptions.ConnectTimeout:
-                category = "connect_timeout"
+                last_error = DartError(stage, "connect_timeout")
             except requests.exceptions.ReadTimeout:
-                category = "read_timeout"
+                last_error = DartError(stage, "read_timeout")
             except requests.exceptions.RequestException:
-                category = "connection"
-            if attempt < attempts - 1:
-                self.sleeper(0.6 * (attempt + 1))
-            else:
-                raise DartError(stage, category) from None
-        raise DartError(stage, "connection")
+                last_error = DartError(stage, "connection")
+        raise last_error or DartError(stage, "connection")
 
     @staticmethod
     def read_json(response, stage):
